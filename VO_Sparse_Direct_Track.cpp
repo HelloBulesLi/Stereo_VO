@@ -168,7 +168,7 @@ typedef Eigen::Matrix<double,64,64> Matrix64d;
 typedef Eigen::Matrix<double,16,1> Vector16d;
 typedef Eigen::Matrix<double,64,1> Vector64d;
 
-uint8_t patch_size = 4;
+uint8_t patch_size = 8;
 
 class EdgeDirectProjection : public g2o::BaseUnaryEdge<16, Vector16d, VertexSophus> {
 // class EdgeDirectProjection : public g2o::BaseUnaryEdge<64, Vector64d, VertexSophus> {

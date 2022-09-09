@@ -361,6 +361,8 @@ void TrackLastFrameDirSingle(
 
 void TrackPointsSelect(cv::Mat &frame, VecVec4d &opt_points, cv::Mat &depth);
 
+void ImgViewer(cv::Mat &frame, VecVec4d &opt_points);
+
 void TrackLastFrameDirSingleMT(
     cv::Mat &last_frame, cv::Mat &cur_frame, VecVec4d opt_points, Sophus::SE3d &rel_pose, Sophus::Vector6d &res);
 
@@ -494,6 +496,7 @@ int main()
         VecVec4d opt_points;
         TrackPointsSelect(last_left, opt_points, last_depth);
         // TrackLastFrameDirSingleMT(last_left, cur_left, opt_points, rel_pose, res);
+        ImgViewer(last_left, opt_points);
         TrackLastFrameDirMultiMT(last_left, cur_left, opt_points, rel_pose, res);
         auto t2 = std::chrono::steady_clock::now();
         std::chrono::duration<double> time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - now);
@@ -1007,24 +1010,160 @@ typedef struct Direct_Pose_MT{
     bool good;
 } Direct_Pose_MT_t;
 
+void ImgViewer(cv::Mat &frame, VecVec4d &opt_points)
+{
+    vector<cv::KeyPoint> Keypoints;
+    Keypoints.resize(opt_points.size());
+    // generate opt points
+    for (int i = 0; i < opt_points.size(); i++) {
+        Keypoints[i].pt.x = opt_points[i](0);
+        Keypoints[i].pt.y = opt_points[i](1);
+    }
+
+    cout << "key pointnum is " << Keypoints.size() << endl;
+    Mat outimg1;
+    drawKeypoints( frame, Keypoints, outimg1, Scalar::all(-1), DrawMatchesFlags::DEFAULT );
+    imshow("FAST_FEATURE",outimg1);
+    double fps = 300;
+    double mT = 1e3/fps;
+    waitKey(mT);
+}
+
+// void TrackPointsSelect(cv::Mat &frame, VecVec4d &opt_points, cv::Mat &depth)
+// {
+//     cv::RNG rng;
+//     int nPoints=1000;
+//     int boarder = 40;
+
+//     // generate opt points
+//     for (int i = 0; i < nPoints; i++) {
+//         int x = rng.uniform(boarder, frame.cols - boarder);  // don't pick pixels close to boarder
+//         int y = rng.uniform(boarder, frame.rows - boarder);  // don't pick pixels close to boarder
+//         Sophus::Vector4d cur_points;
+//         cur_points(0) = x;
+//         cur_points(1) = y;
+//         cur_points(2) = frame.at<uchar>(y, x);
+//         cur_points(3) = depth.at<double>(y, x);
+//         opt_points.push_back(cur_points);
+//     }
+// }
+
+typedef struct grid_point_data
+{
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Matrix<int, 2, 1> start_pos;
+    Eigen::Matrix<int, 2, 1> select_pos;
+    int rows;
+    int cols;
+    double intensity;
+    double th;
+    bool good;
+}grid_point_t;
 void TrackPointsSelect(cv::Mat &frame, VecVec4d &opt_points, cv::Mat &depth)
 {
-    cv::RNG rng;
-    int nPoints=1000;
-    int boarder = 40;
+    int grid_num = 30;
+
+    int grid_cols = floor(frame.cols/grid_num);
+    int grid_rows = floor(frame.rows/grid_num);
+
+    vector<grid_point_t> grid_points;
+    grid_points.resize(grid_num*grid_num);
+    int index = 0;
+    for (int i = 0; i < grid_num; i++)
+        for(int j = 0; j < grid_num; j++)
+        {
+            grid_points[index].start_pos(0) = i*grid_cols;
+            grid_points[index].start_pos(1) = j*grid_rows;
+            grid_points[index].select_pos = grid_points[index].start_pos;
+            grid_points[index].rows = grid_rows;
+            grid_points[index].cols = grid_cols;
+            grid_points[index].intensity = 0;
+            grid_points[index].th = 255;
+            grid_points[index].good = false;
+            index++;
+        }
+
 
     // generate opt points
-    for (int i = 0; i < nPoints; i++) {
-        int x = rng.uniform(boarder, frame.cols - boarder);  // don't pick pixels close to boarder
-        int y = rng.uniform(boarder, frame.rows - boarder);  // don't pick pixels close to boarder
-        Sophus::Vector4d cur_points;
-        cur_points(0) = x;
-        cur_points(1) = y;
-        cur_points(2) = frame.at<uchar>(y, x);
-        cur_points(3) = depth.at<double>(y, x);
-        opt_points.push_back(cur_points);
+    std::for_each(std::execution::par_unseq, grid_points.begin(), grid_points.end(),
+    [&frame](auto &grid_point) {
+        uint8_t grid_pixel_hist[50] = {0};
+        double grad_max = 0;
+        int max_pos[2] = {0,0};
+        double last_pixel_grad = 0;
+        for(int i = 0; i < grid_point.rows; i++)
+            for(int j = 0; j < grid_point.cols; j++)
+            {
+                if (grid_point.start_pos(0)+j-1 < 0 || grid_point.start_pos(0)+j+ 1 > frame.cols 
+                    || grid_point.start_pos(1)+i-1 < 0 || grid_point.start_pos(1)+i + 1 > frame.rows )
+                {
+                    grid_point.good = false;
+                    return;
+                }
+                double Ix = frame.at<uchar>(grid_point.start_pos(1)+i, grid_point.start_pos(0)+j+1)
+                            - frame.at<uchar>(grid_point.start_pos(1)+i, grid_point.start_pos(0)+j-1)/2.0;
+                double Iy = frame.at<uchar>(grid_point.start_pos(1)+i+1, grid_point.start_pos(0)+j)
+                            - frame.at<uchar>(grid_point.start_pos(1)+i-1, grid_point.start_pos(0)+j)/2.0;
+                int intens = sqrt(Ix*Ix + Iy*Iy);
+                if (intens > grad_max)
+                {
+                    grad_max = intens;
+                    max_pos[0] = grid_point.start_pos(0)+j;
+                    max_pos[1] = grid_point.start_pos(1)+i;
+                }
+                if (intens > 48)
+                {
+                    intens = 48;
+                }
+                grid_pixel_hist[intens+1]++;
+                grid_pixel_hist[0]++;
+            }
+        
+        int th = grid_pixel_hist[0]*0.5+0.5f;
+        int i;
+        for(i=0; i < 49;i++)
+        {
+            th -= grid_pixel_hist[i+1];
+            if(th<0)
+            {
+                grid_point.th = i + 7;
+                break;
+            }
+        }
+        if (i == 49)
+        {
+            grid_point.th = 48 + 7;
+        }
+
+        if (grad_max > grid_point.th)
+        {
+            grid_point.good = true;
+            grid_point.intensity = grad_max;
+            grid_point.select_pos(0) = max_pos[0];
+            grid_point.select_pos(1) = max_pos[1];
+        }
+        else
+        {
+            grid_point.good = false;
+        }
+    });
+
+    for (int i = 0; i < grid_points.size(); i++) {
+        if (grid_points[i].good)
+        {
+            int x = grid_points[i].select_pos(0);  // don't pick pixels close to boarder
+            int y = grid_points[i].select_pos(1);  // don't pick pixels close to boarder
+            Sophus::Vector4d cur_points;
+            cur_points(0) = x;
+            cur_points(1) = y;
+            cur_points(2) = grid_points[i].intensity;
+            cur_points(3) = depth.at<double>(y, x);
+            opt_points.push_back(cur_points);
+        }
     }
+
 }
+
 //GN iteration times:100, max used point 1000 
 void TrackLastFrameDirSingleMT(
     cv::Mat &last_frame, cv::Mat &cur_frame, VecVec4d opt_points, Sophus::SE3d &rel_pose, Sophus::Vector6d &res)
